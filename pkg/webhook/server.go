@@ -3,12 +3,17 @@ package webhook
 import (
 	"encoding/json"
 	"net/http"
+	"time"
 
 	"github.com/ofek/csi-gcs/pkg/util"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog"
 )
 
@@ -17,6 +22,7 @@ type handler struct {
 	driverReadyLabel            string
 	driverReadySelectorPodPatch []byte
 	driverName                  string
+	driverStorageClasses        driverStorageClassesSet
 }
 
 func NewServer(driverName string) (http.Handler, error) {
@@ -49,11 +55,69 @@ func NewServer(driverName string) (http.Handler, error) {
 		driverReadyLabel:            util.DriverReadyLabel(driverName),
 		driverReadySelectorPodPatch: patchBytes,
 		driverName:                  driverName,
+		driverStorageClasses: driverStorageClassesSet{
+			classes: make(map[string]struct{}),
+		},
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mutate-inject-driver-ready-selector", h.handleInjectDriverReadySelector)
 	mux.HandleFunc("/healthz", h.handleHealthz)
+
+	lw := cache.NewListWatchFromClient(
+		clientset.StorageV1().RESTClient(),
+		"storageclasses",
+		metav1.NamespaceAll,
+		fields.Everything(),
+	)
+	_, c := cache.NewInformer(lw,  &storagev1.StorageClass{}, 10 * time.Second, cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			stc, ok := obj.(*storagev1.StorageClass)
+			if !ok {
+				klog.Warningf("Received unexpected create event '%v'", obj)
+				return
+			}
+			if stc.Provisioner == driverName {
+				klog.V(6).Infof("Adding '%s' from known storage class", stc.Name)
+				h.driverStorageClasses.add(stc.Name)
+				if stc.Annotations["storageclass.kubernetes.io/is-default-class"] == "true" {
+					h.driverStorageClasses.add("")
+				}
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			stc, ok := obj.(*storagev1.StorageClass)
+			if !ok {
+				klog.Warningf("Received unexpected delete event '%v'", obj)
+				return
+			}
+			if stc.Provisioner == driverName {
+				klog.V(6).Infof("Removing '%s' from known storage class", stc.Name)
+				h.driverStorageClasses.remove(stc.Name)
+				if stc.Annotations["storageclass.kubernetes.io/is-default-class"] == "true" {
+					h.driverStorageClasses.remove("")
+				}
+			}
+		},
+		UpdateFunc: func(oldo, newo interface{}) {
+			newstc, ok := newo.(*storagev1.StorageClass)
+			if !ok {
+				klog.Warningf("Received unexpected update event '%v'", newo)
+				return
+			}
+
+			if newstc.Provisioner == driverName {
+				klog.V(6).Infof("Adding '%s' to known storage class", newstc.Name)
+				h.driverStorageClasses.add(newstc.Name)
+				if newstc.Annotations["storageclass.kubernetes.io/is-default-class"] == "true" {
+					h.driverStorageClasses.add("")
+				}
+				return
+			}
+		},
+	})
+	var stopCh <- chan struct{}
+	go c.Run(stopCh)
 
 	return mux, nil
 }
@@ -100,7 +164,7 @@ func (h *handler) handleInjectDriverReadySelector(w http.ResponseWriter, r *http
 	if podHasDriverReadyLabelSelectorOrAffinity(&pod, h.driverReadyLabel) {
 		klog.V(5).Infof("Skipping pod %s/%s already has driver ready preference", pod.Namespace, pod.Name)
 	} else {
-		if podHasCsiGCSVolume(&pod, h.driverName, h.k8sClient.CoreV1()) {
+		if podHasCsiGCSVolume(&pod, h.driverName, h.k8sClient.CoreV1(), h.driverStorageClasses) {
 			klog.V(5).Infof("Mutating pod %s/%s", pod.Namespace, pod.Name)
 			patchType := admissionv1.PatchTypeJSONPatch
 			admresp.PatchType = &patchType

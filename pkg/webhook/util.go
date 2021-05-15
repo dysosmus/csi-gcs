@@ -44,7 +44,7 @@ func podHasDriverReadyLabelSelectorOrAffinity(pod *corev1.Pod, driverReadyLabel 
 }
 
 // podHasCsiGCSVolume return true if a Pod use a csi-gcs volume.
-func podHasCsiGCSVolume(pod *corev1.Pod, driverName string, k8sClientCore corev1Client.CoreV1Interface) bool {
+func podHasCsiGCSVolume(pod *corev1.Pod, driverName string,  k8sClientCore corev1Client.CoreV1Interface, driverStorageClasses driverStorageClassesSet) bool {
 	// The checks of the presence of gcs.csi.ofek.dev volume are done in two time
 	// The first check if there isn't a PV directly mounted through the CSI spec.
 	// It requires no extra network calls.
@@ -70,8 +70,14 @@ func podHasCsiGCSVolume(pod *corev1.Pod, driverName string, k8sClientCore corev1
 			klog.Warningf("Unable to fetch PersistentVolumeClaim '%s/%s': %v", pod.Namespace, pod.Spec.Volumes[idx].PersistentVolumeClaim.ClaimName, err)
 			continue
 		}
-		provisioner, exist := pvc.Annotations["volume.beta.kubernetes.io/storage-provisioner"]
-		if !exist || provisioner != driverName {
+
+		// user can request the default storage class by not setting one or set it to an empty string
+		// if the driver is backing one of the default storage class driverStorageClasses will return true for a empty string
+		storageClassName := ""
+		if pvc.Spec.StorageClassName != nil {
+			storageClassName = *pvc.Spec.StorageClassName
+		}
+		if !driverStorageClasses.has(storageClassName) {
 			continue
 		}
 		return true
